@@ -187,7 +187,7 @@ import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cann
 // ---------- 定数 ----------
 const CFG = {
   moveSpeed: 4.4,        // 前後最高速度 m/s
-  turnSpeed: 1.9,        // 旋回速度 rad/s
+  turnSpeed: 1.1,        // 旋回速度 rad/s
   accel: 7.5,            // 目標速度への追従の強さ
   armMin: -0.55,         // アーム最下点(ラジアン)
   armMax: 0.9,           // アーム最上点(ラジアン)
@@ -378,6 +378,7 @@ function addStaticBox(x, y, z, w, h, d, color) {
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d),
     new THREE.MeshStandardMaterial({ color, roughness:0.85, transparent:true, opacity:1 }));
   mesh.position.set(x, y, z);
+  mesh.userData.half = { x: w/2, y: h/2, z: d/2 }; // アームが重なっているかの判定に使う
   mesh.castShadow = true; mesh.receiveShadow = true;
   scene.add(mesh);
   const body = new CANNON.Body({ type: CANNON.Body.STATIC,
@@ -563,43 +564,6 @@ function updateRhythm() {
   }
 }
 
-// ---------- 「ウィーン」というやわらかいモーター音(移動・アーム操作時) ----------
-let whirNode = null;
-function startWhir() {
-  if (!AC || whirNode) return;
-  const osc = AC.createOscillator();
-  osc.type = 'sine';
-  osc.frequency.value = 170;
-  const filter = AC.createBiquadFilter();
-  filter.type = 'lowpass';
-  filter.frequency.value = 500;
-  const gain = AC.createGain();
-  gain.gain.value = 0.0001;
-  // 微妙なビブラートで「ウィーン」というモーターらしいゆらぎを出す(ノイズは使わないので耳ざわりにならない)
-  const lfo = AC.createOscillator();
-  lfo.type = 'sine';
-  lfo.frequency.value = 7;
-  const lfoGain = AC.createGain();
-  lfoGain.gain.value = 7;
-  lfo.connect(lfoGain).connect(osc.frequency);
-  lfo.start();
-  osc.connect(filter).connect(gain).connect(masterGain);
-  osc.start();
-  whirNode = { osc, filter, gain, lfo, lfoGain };
-}
-function updateWhir(active01) {
-  if (!whirNode || !AC) return;
-  const t = AC.currentTime;
-  const targetGain = active01 > 0.03 ? 0.045 + active01 * 0.05 : 0.0001;
-  whirNode.gain.gain.setTargetAtTime(targetGain, t, 0.09);
-  whirNode.osc.frequency.setTargetAtTime(160 + active01 * 130, t, 0.12);
-  whirNode.filter.frequency.setTargetAtTime(380 + active01 * 420, t, 0.12);
-}
-function stopWhir() {
-  if (!whirNode) return;
-  try { whirNode.osc.stop(); whirNode.lfo.stop(); } catch(e) {}
-  whirNode = null;
-}
 const SND = {
   ready: () => beep(660, 0.15, 'square', 0.14),
   go:    () => { beep(880, 0.18, 'square', 0.18); beep(1320, 0.22, 'square', 0.14, 0.12); },
@@ -783,7 +747,6 @@ function beginPlay() {
   elapsed = 0;
   setState(S.PLAYING);
   startRhythm();
-  startWhir();
   updateHUD();
 }
 
@@ -791,7 +754,6 @@ function doClear() {
   setState(S.CLEAR);
   setPlayUI(false);
   stopRhythm();
-  stopWhir();
   SND.fanfare();
   spawnConfetti();
   $('resTime').textContent = fmtTime(elapsed);
@@ -1082,12 +1044,26 @@ function updateCamera(dt) {
   }
 }
 
-// ---------- カメラをさえぎる壁の半透明化(オクルージョンフェード) ----------
+// ---------- カメラをさえぎる壁 / アームが重なった物体の半透明化(オクルージョンフェード) ----------
 const wallRaycaster = new THREE.Raycaster();
 let fadedWalls = new Set();
+const _pivotWorld = new THREE.Vector3();
+const _midWorld = new THREE.Vector3();
+
+function boxOverlapsPoint(mesh, px, py, pz, margin) {
+  const half = mesh.userData.half;
+  if (!half) return false;
+  return Math.abs(px - mesh.position.x) < half.x + margin &&
+         Math.abs(py - mesh.position.y) < half.y + margin &&
+         Math.abs(pz - mesh.position.z) < half.z + margin;
+}
 
 function updateWallFade(dt) {
+  const camFaded = new Set();
+  const armFaded = new Set();
+
   if (viewMode === 0) {
+    // カメラと車体の間にある壁を透明化(自分が壁で見えなくなるのを防ぐ、こちらはしっかり透かす)
     const from = new THREE.Vector3(camTarget.x, camTarget.y + 0.3, camTarget.z);
     const to = camera.position;
     const dir = new THREE.Vector3().subVectors(to, from);
@@ -1099,15 +1075,29 @@ function updateWallFade(dt) {
       const collidables = [];
       for (const o of courseObjects) if (o.body && o.mesh) collidables.push(o.mesh);
       const hits = wallRaycaster.intersectObjects(collidables, false);
-      fadedWalls = new Set(hits.map(h => h.object));
+      for (const h of hits) camFaded.add(h.object);
     }
-  } else {
-    fadedWalls = new Set(); // 一人称視点ではオクルージョンフェード不要
   }
+
+  // アーム(ブーム〜クロー)が台や壁にめり込んで見えるのを防ぐため、
+  // 重なっている物体があれば「気づく程度に薄く」する(カメラ遮蔽ほど透かさない)
+  boomPivot.getWorldPosition(_pivotWorld);
+  _midWorld.lerpVectors(_pivotWorld, clawWorldPos, 0.5);
+  const armPts = [_pivotWorld, _midWorld, clawWorldPos];
+  for (const o of courseObjects) {
+    if (!o.body || !o.mesh || !o.mesh.userData.half) continue;
+    for (const pt of armPts) {
+      if (boxOverlapsPoint(o.mesh, pt.x, pt.y, pt.z, 0.3)) { armFaded.add(o.mesh); break; }
+    }
+  }
+
+  fadedWalls = new Set([...camFaded, ...armFaded]);
   for (const o of courseObjects) {
     if (!o.body || !o.mesh || !o.mesh.material) continue;
     const mat = o.mesh.material;
-    const targetOpacity = fadedWalls.has(o.mesh) ? 0.15 : 1;
+    let targetOpacity = 1;
+    if (camFaded.has(o.mesh)) targetOpacity = 0.15;      // カメラを遮る壁はしっかり透かす
+    else if (armFaded.has(o.mesh)) targetOpacity = 0.55; // アームのめり込みは薄くする程度
     mat.opacity += (targetOpacity - mat.opacity) * Math.min(1, dt * 10);
     mat.depthWrite = mat.opacity > 0.6; // 半透明時の重なり順の乱れを軽減
   }
@@ -1131,11 +1121,6 @@ function loop() {
   syncExcavVisual();
 
   updateRhythm();
-  {
-    const move01 = Math.min(1, excavSpeed() / CFG.moveSpeed);
-    const arm01 = Math.min(1, Math.abs(armInput));
-    updateWhir(Math.max(move01, arm01));
-  }
 
   const tt = clock.elapsedTime;
   for (const p of packages) {
