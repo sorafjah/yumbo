@@ -186,16 +186,16 @@ import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cann
 
 // ---------- 定数 ----------
 const CFG = {
-  moveSpeed: 3.0,        // 前後最高速度 m/s
-  turnSpeed: 1.5,        // 旋回速度 rad/s
-  accel: 6.0,            // 目標速度への追従の強さ
+  moveSpeed: 4.4,        // 前後最高速度 m/s
+  turnSpeed: 1.9,        // 旋回速度 rad/s
+  accel: 7.5,            // 目標速度への追従の強さ
   armMin: -0.55,         // アーム最下点(ラジアン)
   armMax: 0.9,           // アーム最上点(ラジアン)
   armSpeed: 0.7,         // アームが動く速さ rad/s（ゆっくり・唐突にしない）
   grabDist: 1.6,         // クロー先端と荷物の水平距離(これ以内でつかめる)
   grabHeightTol: 0.75,   // クロー先端と荷物の高さの差(これ以内でつかめる)
   padDist: 1.5,          // 納品パッドとの距離判定(水平)
-  grabMaxSpeed: 2.2,     // これより速く動いていたらつかめない/はなせない(安定のため)
+  grabMaxSpeed: 2.8,     // これより速く動いていたらつかめない/はなせない(安定のため)
   dropHeightLimit: 0.85, // 対象の面より、これ以上高い(または低い)位置で離すと届けられない
   pedestalHeight: 2.3,   // 高台(荷物・パッド用)の高さ(アームをしっかり上げないと届かない高さ)
   pedestalSize: 1.7,     // 高台の一辺の長さ
@@ -318,8 +318,7 @@ scene.add(excav);
 
 let armAngle = (CFG.armMin + CFG.armMax) / 2; // アーム角度(現在値)
 let armTarget = armAngle;                      // 目標角度(即座に反映、動きは速度制限)
-let clawClosed = false;                        // クローの開閉状態
-let clawAnim = 0;                               // 0=開 1=閉(見た目の補間用)
+let clawAnim = 0;                               // 0=開 1=閉(見た目の補間用、実際に持っているかで決まる)
 let viewMode = 0;                               // 0=斜め上から見おろし 1=運転席(一人称)
 
 // ---------- 物理ボディ(球で簡略化。衝突安定・全方向対応) ----------
@@ -397,8 +396,7 @@ function buildCourse(idx) {
   for (const p of packages) { scene.remove(p.mesh); scene.remove(p.pad); }
   packages = [];
   heldPkg = null;
-  clawClosed = false;
-  clawTarget();
+  updateClawButton();
 
   const C = COURSES[idx % COURSES.length];
 
@@ -518,7 +516,7 @@ const RHYTHM_PATTERN = [
   2,1,0,1, 2,3,4,-1,          // フレーズB'(-1は休符)
 ];
 const RHYTHM_BASS = [130.81, 130.81, 196.00, 196.00, 220.00, 220.00, 174.61, 174.61]; // C-C-G-G-Am-Am-F-F進行
-const RHYTHM_BPM = 128;
+const RHYTHM_BPM = 138;
 const RHYTHM_STEP = 60 / RHYTHM_BPM / 2; // 8分音符ぶん
 let rhythmActive = false;
 let rhythmStep = 0;
@@ -563,6 +561,44 @@ function updateRhythm() {
     rhythmStep++;
     nextNoteTime += RHYTHM_STEP;
   }
+}
+
+// ---------- 「ウィーン」というやわらかいモーター音(移動・アーム操作時) ----------
+let whirNode = null;
+function startWhir() {
+  if (!AC || whirNode) return;
+  const osc = AC.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.value = 170;
+  const filter = AC.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.value = 500;
+  const gain = AC.createGain();
+  gain.gain.value = 0.0001;
+  // 微妙なビブラートで「ウィーン」というモーターらしいゆらぎを出す(ノイズは使わないので耳ざわりにならない)
+  const lfo = AC.createOscillator();
+  lfo.type = 'sine';
+  lfo.frequency.value = 7;
+  const lfoGain = AC.createGain();
+  lfoGain.gain.value = 7;
+  lfo.connect(lfoGain).connect(osc.frequency);
+  lfo.start();
+  osc.connect(filter).connect(gain).connect(masterGain);
+  osc.start();
+  whirNode = { osc, filter, gain, lfo, lfoGain };
+}
+function updateWhir(active01) {
+  if (!whirNode || !AC) return;
+  const t = AC.currentTime;
+  const targetGain = active01 > 0.03 ? 0.045 + active01 * 0.05 : 0.0001;
+  whirNode.gain.gain.setTargetAtTime(targetGain, t, 0.09);
+  whirNode.osc.frequency.setTargetAtTime(160 + active01 * 130, t, 0.12);
+  whirNode.filter.frequency.setTargetAtTime(380 + active01 * 420, t, 0.12);
+}
+function stopWhir() {
+  if (!whirNode) return;
+  try { whirNode.osc.stop(); whirNode.lfo.stop(); } catch(e) {}
+  whirNode = null;
 }
 const SND = {
   ready: () => beep(660, 0.15, 'square', 0.14),
@@ -644,18 +680,17 @@ bindHold(document.getElementById('armDownBtn'), -1);
 // ---------- つかむ/はなすボタン(タップでON/OFF切替) ----------
 const clawBtn = document.getElementById('clawBtn');
 const clawBtnText = document.getElementById('clawBtnText');
-function clawTarget() {
-  clawBtn.classList.toggle('closed', clawClosed);
-  clawBtnText.textContent = clawClosed ? 'はなす' : 'つかむ';
+function updateClawButton() {
+  const holding = !!heldPkg;
+  clawBtn.classList.toggle('closed', holding);
+  clawBtnText.textContent = holding ? 'はなす' : 'つかむ';
 }
 clawBtn.addEventListener('click', () => {
   if (state !== S.PLAYING) return;
-  clawClosed = !clawClosed;
-  clawTarget();
-  SND.clank();
-  if (!clawClosed) tryRelease();
+  if (heldPkg) tryRelease();
+  else tryGrab();
 });
-clawTarget();
+updateClawButton();
 
 // ---------- iPad Safariのジェスチャー無効化 ----------
 document.addEventListener('touchmove', (e) => e.preventDefault(), { passive:false });
@@ -706,8 +741,8 @@ function fmtTime(sec) {
 
 function updateHUD() {
   timerText.textContent = fmtTime(elapsed);
-  clawIcon.textContent = clawClosed ? '✊' : '🖐';
-  clawText.textContent = clawClosed ? 'クローズ' : 'オープン';
+  clawIcon.textContent = heldPkg ? '✊' : '🖐';
+  clawText.textContent = heldPkg ? 'つかんでいる' : 'あいている';
   if (heldPkg) {
     cargoChip.style.background = heldPkg.color.css;
     cargoName.textContent = heldPkg.color.name + 'の荷物';
@@ -748,6 +783,7 @@ function beginPlay() {
   elapsed = 0;
   setState(S.PLAYING);
   startRhythm();
+  startWhir();
   updateHUD();
 }
 
@@ -755,6 +791,7 @@ function doClear() {
   setState(S.CLEAR);
   setPlayUI(false);
   stopRhythm();
+  stopWhir();
   SND.fanfare();
   spawnConfetti();
   $('resTime').textContent = fmtTime(elapsed);
@@ -766,6 +803,7 @@ function resetGame(nextCourse) {
   elapsed = 0;
   buildCourse(courseIndex);
   clearConfetti();
+  clearFailPoofs();
   updateHUD();
 }
 
@@ -804,9 +842,29 @@ function dropPackageToGround(p) {
   SND.release();
 }
 
+function tryGrab() {
+  if (heldPkg) return;
+  if (excavSpeed() > CFG.grabMaxSpeed) { showToast('動きながらは、つかめないよ'); return; }
+  for (const p of packages) {
+    if (p.state !== 'idle') continue;
+    const dxz = Math.hypot(clawWorldPos.x - p.mesh.position.x, clawWorldPos.z - p.mesh.position.z);
+    const dy = Math.abs(clawWorldPos.y - p.mesh.position.y);
+    if (dxz < CFG.grabDist && dy < CFG.grabHeightTol) {
+      p.state = 'held';
+      heldPkg = p;
+      SND.grab();
+      showToast(`${p.color.name}の荷物をつかんだ！`, true, 1000);
+      updateClawButton();
+      return;
+    }
+  }
+  // 近くにつかめる荷物がなかった(ボタンの表示は「つかむ」のまま変えない)
+  SND.clank();
+}
+
 function tryRelease() {
   if (!heldPkg) return;
-  if (excavSpeed() > CFG.grabMaxSpeed) { clawClosed = true; clawTarget(); showToast('動きながらは、はなせないよ'); return; }
+  if (excavSpeed() > CFG.grabMaxSpeed) { showToast('動きながらは、はなせないよ'); return; }
   const p = heldPkg;
 
   // クロー先端が「どのパッドの近く」にいるか(自分のでも他人のでも)を調べる
@@ -822,13 +880,17 @@ function tryRelease() {
   if (heightGap > CFG.dropHeightLimit) {
     SND.tooHigh();
     showToast('❗ たかいところから落とさないで！ちゃんとおろしてからはなそう', false, 1800);
+    spawnFailPoof(clawWorldPos.x, Math.max(0.2, surfaceY), clawWorldPos.z);
     dropPackageToGround(p);
+    updateClawButton();
     return;
   }
   if (nearestPad && heightGap < -CFG.dropHeightLimit) {
     SND.tooHigh();
     showToast('⬆️ もうすこしアームを上げてからとどけよう', false, 1800);
+    spawnFailPoof(clawWorldPos.x, Math.max(0.2, clawWorldPos.y), clawWorldPos.z);
     dropPackageToGround(p);
+    updateClawButton();
     return;
   }
 
@@ -839,30 +901,17 @@ function tryRelease() {
     heldPkg = null;
     SND.deliver();
     showToast(`${p.color.name}の荷物をとどけた！ 🎉`, true, 1200);
+    updateClawButton();
     const rest = packages.filter(q => q.state !== 'delivered').length;
     if (rest === 0) setTimeout(() => doClear(), 900);
     return;
   }
   if (nearestPad) { SND.wrong(); showToast('❌ 色がちがうよ！'); }
   dropPackageToGround(p);
+  updateClawButton();
 }
 
-function checkClaw() {
-  if (clawClosed && !heldPkg) {
-    if (excavSpeed() > CFG.grabMaxSpeed) return;
-    for (const p of packages) {
-      if (p.state !== 'idle') continue;
-      const dxz = Math.hypot(clawWorldPos.x - p.mesh.position.x, clawWorldPos.z - p.mesh.position.z);
-      const dy = Math.abs(clawWorldPos.y - p.mesh.position.y);
-      if (dxz < CFG.grabDist && dy < CFG.grabHeightTol) {
-        p.state = 'held';
-        heldPkg = p;
-        SND.grab();
-        showToast(`${p.color.name}の荷物をつかんだ！`, true, 1000);
-        break;
-      }
-    }
-  }
+function updateHeldFollow() {
   if (heldPkg) {
     const m = heldPkg.mesh;
     // 安定して追従(揺れすぎないように補間)
@@ -912,6 +961,57 @@ function updateConfetti(dt) {
   pos.needsUpdate = true;
 }
 
+// ---------- 失敗(高いところから落とした)ときの砂ぼこりエフェクト ----------
+const failPoofs = [];
+function spawnFailPoof(x, y, z) {
+  const N = 26;
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(N*3), col = new Float32Array(N*3);
+  const vel = [];
+  const palette = [0x9a8060, 0x7a6045, 0xaaaaaa, 0x6a5540];
+  const c = new THREE.Color();
+  for (let i = 0; i < N; i++) {
+    pos[i*3] = x; pos[i*3+1] = y; pos[i*3+2] = z;
+    c.setHex(palette[Math.floor(Math.random()*palette.length)]);
+    col[i*3] = c.r; col[i*3+1] = c.g; col[i*3+2] = c.b;
+    const ang = Math.random() * Math.PI * 2;
+    const spd = 1.3 + Math.random() * 2.2;
+    vel.push(new THREE.Vector3(Math.cos(ang)*spd, 1.2 + Math.random()*1.8, Math.sin(ang)*spd));
+  }
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  const mat = new THREE.PointsMaterial({ size:0.15, vertexColors:true, transparent:true, opacity:1 });
+  const points = new THREE.Points(geo, mat);
+  scene.add(points);
+  failPoofs.push({ points, vel, life: 0 });
+}
+function updateFailPoofs(dt) {
+  for (let i = failPoofs.length - 1; i >= 0; i--) {
+    const f = failPoofs[i];
+    f.life += dt;
+    const pos = f.points.geometry.attributes.position;
+    for (let j = 0; j < f.vel.length; j++) {
+      const v = f.vel[j];
+      v.y -= 9.8 * dt * 0.7;
+      pos.array[j*3]   += v.x * dt;
+      pos.array[j*3+1] += v.y * dt;
+      pos.array[j*3+2] += v.z * dt;
+      if (pos.array[j*3+1] < 0.03) { pos.array[j*3+1] = 0.03; v.x *= 0.8; v.z *= 0.8; v.y = 0; }
+    }
+    pos.needsUpdate = true;
+    f.points.material.opacity = Math.max(0, 1 - f.life / 0.7);
+    if (f.life > 0.7) {
+      scene.remove(f.points);
+      f.points.geometry.dispose();
+      failPoofs.splice(i, 1);
+    }
+  }
+}
+function clearFailPoofs() {
+  for (const f of failPoofs) { scene.remove(f.points); f.points.geometry.dispose(); }
+  failPoofs.length = 0;
+}
+
 // ---------- 車体の制御 ----------
 function controlExcav(dt) {
   if (state !== S.PLAYING) {
@@ -936,7 +1036,7 @@ function controlExcav(dt) {
   boomPivot.rotation.x = armAngle;
 
   // クローの開閉アニメーション(補間)
-  const clawGoal = clawClosed ? 1 : 0;
+  const clawGoal = heldPkg ? 1 : 0;
   clawAnim += (clawGoal - clawAnim) * Math.min(1, dt*8);
   const openAngle = THREE.MathUtils.lerp(0.55, 0.05, clawAnim);
   clawProngs[0].rotation.x = -openAngle;
@@ -1022,7 +1122,7 @@ function loop() {
 
   if (state === S.PLAYING) {
     elapsed += dt;
-    checkClaw();
+    updateHeldFollow();
     updateHUD();
   }
 
@@ -1031,6 +1131,11 @@ function loop() {
   syncExcavVisual();
 
   updateRhythm();
+  {
+    const move01 = Math.min(1, excavSpeed() / CFG.moveSpeed);
+    const arm01 = Math.min(1, Math.abs(armInput));
+    updateWhir(Math.max(move01, arm01));
+  }
 
   const tt = clock.elapsedTime;
   for (const p of packages) {
@@ -1042,6 +1147,7 @@ function loop() {
   }
 
   updateConfetti(dt);
+  updateFailPoofs(dt);
   updateCamera(dt);
   updateWallFade(dt);
   renderer.render(scene, camera);
